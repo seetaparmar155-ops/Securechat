@@ -1,0 +1,20 @@
+{
+  "name": "securechat-demo",
+  "version": "1.0.0",
+  "description": "Secure E2EE chat demo using ECDH (P-256) + AES-GCM, Node.js + WebSocket + WebCrypto",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "body-parser": "^1.20.2",
+    "cookie-parser": "^1.4.6",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "ws": "^8.13.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

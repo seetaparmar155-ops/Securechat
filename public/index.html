@@ -1,0 +1,264 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SecureChat – Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: Inter, Arial, Helvetica, sans-serif; max-width:900px; margin:20px auto; }
+    #login, #chat { border:1px solid #e6e6e6; padding:18px; border-radius:10px; box-shadow: 0 6px 18px rgba(0,0,0,0.03); }
+    #msgs { height:360px; overflow:auto; border:1px solid #f1f1f1; padding:12px; margin-bottom:8px; background:#fafafa; border-radius:8px; }
+    .msg { margin:8px 0; padding:6px 10px; display:inline-block; max-width:80%; border-radius:8px; }
+    .mine { background:#dff7e6; margin-left:auto; text-align:right; }
+    .theirs { background:#ffffff; }
+    .meta { font-size:11px; color:#666; margin-top:6px; }
+    label { display:block; margin-top:8px; }
+    input, select, button { padding:8px 10px; font-size:14px; border-radius:6px; border:1px solid #ddd; }
+    .row { display:flex; gap:8px; align-items:center; }
+    .muted { color:#666; font-size:13px; }
+    .system { font-style:italic; color:#888; font-size:13px; margin:8px 0; }
+  </style>
+</head>
+<body>
+  <h2>SecureChat – Demo (E2EE with ECDH & AES-GCM)</h2>
+
+  <div id="auth">
+    <div id="login">
+      <h3>Register / Login</h3>
+      <div class="row">
+        <input id="username" placeholder="username" />
+        <input id="password" type="password" placeholder="password" />
+      </div>
+      <div style="margin-top:10px" class="row">
+        <button id="btn-register">Register</button>
+        <button id="btn-login">Login</button>
+        <div id="auth-status" class="muted"></div>
+      </div>
+      <div class="system">Open this page twice (two windows/incognito) to test two users chatting.</div>
+      <div id="presence" class="muted">Not connected</div>
+    </div>
+  </div>
+
+  <div id="chat" style="display:none; margin-top:12px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div>Logged in as: <strong id="me-name"></strong></div>
+      <div><button id="btn-logout">Logout</button></div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <label>Chat with:
+        <select id="peer-select"><option value="">--select user--</option></select>
+        <button id="btn-init-key">Initiate Key Exchange</button>
+      </label>
+    </div>
+
+    <div id="msgs"></div>
+
+    <div class="row">
+      <input id="message" style="flex:1" placeholder="Type message..." />
+      <button id="btn-send">Send encrypted</button>
+    </div>
+  </div>
+
+<script>
+// Client code (same as demo)
+// Helper base64 <-> arraybuffer
+const bs64 = {
+  toBase64: (arr) => btoa(String.fromCharCode(...new Uint8Array(arr))),
+  fromBase64: (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+};
+const abToBase64 = (ab) => bs64.toBase64(new Uint8Array(ab));
+const base64ToAb = (b64) => bs64.fromBase64(b64).buffer;
+
+let ws;
+let me = null;
+let peers = [];
+const keys = {};
+const ecdhPairs = {};
+
+async function api(path, data) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data||{})
+  });
+  return res.json();
+}
+
+const usernameEl = document.getElementById('username');
+const passwordEl = document.getElementById('password');
+const authStatus = document.getElementById('auth-status');
+const meName = document.getElementById('me-name');
+const chatDiv = document.getElementById('chat');
+const presenceDiv = document.getElementById('presence');
+const peerSelect = document.getElementById('peer-select');
+const msgsDiv = document.getElementById('msgs');
+
+document.getElementById('btn-register').onclick = async () => {
+  const u = usernameEl.value.trim(), p = passwordEl.value;
+  if (!u || !p) return authStatus.textContent = 'enter both';
+  const r = await api('/register', { username: u, password: p });
+  authStatus.textContent = r.ok ? 'registered — now login' : ('error: ' + (r.error||JSON.stringify(r)));
+};
+
+document.getElementById('btn-login').onclick = async () => {
+  const u = usernameEl.value.trim(), p = passwordEl.value;
+  if (!u || !p) return authStatus.textContent = 'enter both';
+  const r = await api('/login', { username: u, password: p });
+  if (r.ok) {
+    authStatus.textContent = 'logged in as ' + r.username;
+    startApp();
+  } else {
+    authStatus.textContent = 'login failed';
+  }
+};
+
+document.getElementById('btn-logout').onclick = async () => {
+  await api('/logout', {});
+  location.reload();
+};
+
+async function startApp(){
+  const meResp = await fetch('/me');
+  if (!meResp.ok) { authStatus.textContent = 'session invalid'; return; }
+  const meJson = await meResp.json();
+  me = meJson.username;
+  meName.textContent = me;
+  document.getElementById('auth').style.display = 'none';
+  chatDiv.style.display = 'block';
+  connectWS();
+}
+
+function connectWS() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+  ws.onopen = () => { presenceDiv.textContent = 'Connected (ws)'; };
+  ws.onmessage = async (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'presence') {
+      peers = m.users.filter(u => u !== me);
+      renderPeers();
+    } else if (m.type === 'publicKey') {
+      await handleIncomingPublicKey(m.from, m.pub);
+    } else if (m.type === 'encrypted') {
+      await handleIncomingEncrypted(m.from, m.payload);
+    } else if (m.type === 'status') {
+      appendSystem(m.message || '');
+    }
+  };
+  ws.onclose = () => { presenceDiv.textContent = 'Disconnected'; };
+}
+
+function renderPeers() {
+  peerSelect.innerHTML = '<option value="">--select user--</option>';
+  for (const p of peers) {
+    const opt = document.createElement('option');
+    opt.value = p; opt.textContent = p;
+    peerSelect.appendChild(opt);
+  }
+}
+
+// ECDH helpers
+async function generateECDHKeyPair() {
+  return await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: 'P-256' },
+    true,
+    ['deriveKey','deriveBits']
+  );
+}
+async function exportPublicKey(key) {
+  const raw = await crypto.subtle.exportKey('raw', key);
+  return abToBase64(raw);
+}
+async function importPublicKey(rawBase64) {
+  const raw = base64ToAb(rawBase64);
+  return await crypto.subtle.importKey('raw', raw, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+}
+async function deriveAESGCMKey(privateKey, theirPublicKey) {
+  const derived = await crypto.subtle.deriveBits(
+    { name: 'ECDH', public: theirPublicKey },
+    privateKey,
+    256
+  );
+  return await crypto.subtle.importKey('raw', derived, { name: 'AES-GCM' }, false, ['encrypt','decrypt']);
+}
+
+document.getElementById('btn-init-key').onclick = async () => {
+  const peer = peerSelect.value;
+  if (!peer) return alert('select a peer');
+  const kp = await generateECDHKeyPair();
+  const pub = await exportPublicKey(kp.publicKey);
+  ecdhPairs[peer] = { keyPair: kp };
+  ws.send(JSON.stringify({ type: 'publicKey', to: peer, pub }));
+  appendSystem(`Sent public key to ${peer}.`);
+};
+
+async function handleIncomingPublicKey(from, pubB64) {
+  appendSystem(`Received public key from ${from}`);
+  let myPair = ecdhPairs[from] && ecdhPairs[from].keyPair;
+  if (!myPair) {
+    myPair = await generateECDHKeyPair();
+    ecdhPairs[from] = { keyPair: myPair };
+    const myPub = await exportPublicKey(myPair.publicKey);
+    ws.send(JSON.stringify({ type: 'publicKey', to: from, pub: myPub }));
+    appendSystem(`Auto-sent our public key back to ${from}`);
+  }
+  const theirPubKey = await importPublicKey(pubB64);
+  const aesKey = await deriveAESGCMKey(myPair.privateKey || myPair.keyPair.privateKey, theirPubKey);
+  keys[from] = { aesKey, myCounter: 0, theirCounter: 0 };
+  appendSystem(`Shared key established with ${from}`);
+}
+
+document.getElementById('btn-send').onclick = async () => {
+  const peer = peerSelect.value;
+  if (!peer) return alert('select a peer');
+  const txt = document.getElementById('message').value;
+  if (!txt) return;
+  const k = keys[peer];
+  if (!k || !k.aesKey) return alert('No shared key with peer. Initiate key exchange first.');
+  k.myCounter = (k.myCounter || 0) + 1;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder().encode(txt);
+  const aad = new TextEncoder().encode(String(k.myCounter));
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, k.aesKey, enc);
+  const payload = { iv: abToBase64(iv.buffer), ciphertext: abToBase64(cipher), counter: k.myCounter };
+  ws.send(JSON.stringify({ type: 'encrypted', to: peer, payload }));
+  appendMessage(txt, true);
+  document.getElementById('message').value = '';
+};
+
+async function handleIncomingEncrypted(from, payload) {
+  const k = keys[from];
+  if (!k || !k.aesKey) { appendSystem(`Encrypted message received from ${from} but no shared key.`); return; }
+  const incomingCounter = payload.counter || 0;
+  if (incomingCounter <= (k.theirCounter || 0)) { appendSystem(`Rejected old message from ${from}`); return; }
+  const iv = base64ToAb(payload.iv);
+  const cipher = base64ToAb(payload.ciphertext);
+  const aad = new TextEncoder().encode(String(incomingCounter));
+  try {
+    const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv), additionalData: aad, tagLength: 128 }, k.aesKey, new Uint8Array(cipher));
+    const text = new TextDecoder().decode(plainBuf);
+    k.theirCounter = incomingCounter;
+    appendMessage(text, false, from);
+  } catch (e) {
+    appendSystem(`Failed to decrypt message from ${from} — possible tampering or wrong key.`);
+  }
+}
+
+function appendMessage(text, mine, fromName) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + (mine ? 'mine' : 'theirs');
+  d.innerHTML = `<div>${escapeHtml(text)}</div><div class="meta">${mine ? 'me' : (fromName||'peer')} • ${new Date().toLocaleTimeString()}</div>`;
+  msgsDiv.appendChild(d);
+  msgsDiv.scrollTop = msgsDiv.scrollHeight;
+}
+function appendSystem(text) {
+  const d = document.createElement('div');
+  d.className = 'system';
+  d.textContent = text;
+  msgsDiv.appendChild(d);
+  msgsDiv.scrollTop = msgsDiv.scrollHeight;
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]); }
+</script>
+</body>
+</html>
